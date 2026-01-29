@@ -22,6 +22,20 @@ class ScanSnapHandler(FileSystemEventHandler):
     def on_modified(self, event):
         self._handle_event(event)
 
+    def send_request(self, filename, filepath, filesize):
+        payload = {
+            "filename": filename,
+            "filepath": filepath,
+            "filesize": filesize,
+            "timestamp": datetime.utcnow().isoformat() + "Z",
+        }
+
+        try:
+            response = requests.post(WEBHOOK_URL, json=payload, timeout=10)
+            print("  ✓ Webhook triggered" if response.ok else f"  ✗ Webhook error {response.status_code}")
+        except requests.RequestException as e:
+            print(f"  ✗ Webhook failed: {e}")
+
     def _handle_event(self, event):
         if event.is_directory:
             return
@@ -48,17 +62,6 @@ class ScanSnapHandler(FileSystemEventHandler):
         except OSError:
             filesize = 0
 
-        payload = {
-            "filename": filename,
-            "filepath": filepath,
-            "filesize": filesize,
-            "timestamp": datetime.utcnow().isoformat() + "Z",
-        }
-
-        try:
-            response = requests.post(WEBHOOK_URL, json=payload, timeout=10)
-            print("  ✓ Webhook triggered" if response.ok else f"  ✗ Webhook error {response.status_code}")
-        except requests.RequestException as e:
-            print(f"  ✗ Webhook failed: {e}")
+        send_request(filename, filepath, filesize)
 
         print()
