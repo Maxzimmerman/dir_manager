@@ -1,0 +1,17 @@
+name: "dir_manager"
+
+services:
+  dir_ma: 
+    container_name: python_container
+    image: python_image
+    volumes:
+      - /Users/max/Documents/Documents - Max’s MacBook Pro/Private/scan_n8n:/watch
+    build:
+      context: .
+      dockerfile: Dockerfile
+    networks:
+      - n8n_n8n-internal  # Connect to n8n's network
+
+networks:
+  n8n_n8n-internal:
+    external: true  # Use existing network from n8n
