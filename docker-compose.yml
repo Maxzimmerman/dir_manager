@@ -5,7 +5,7 @@ services:
     container_name: python_container
     image: python_image
     volumes:
-      - /Users/max/Documents/Documents - Max’s MacBook Pro/Private/scan_n8n:/watch
+      - /Users/max/Documents/Documents - Max's MacBook Pro/Private/scan_n8n:/home/node/.n8n-files
     build:
       context: .
       dockerfile: Dockerfile

@@ -4,7 +4,7 @@ import requests
 from datetime import datetime
 from watchdog.events import FileSystemEventHandler
 
-WATCH_FOLDER = "/watch"
+WATCH_FOLDER = "/home/node/.n8n-files"
 WEBHOOK_URL = "http://n8n:5678/webhook-test/981184cc-f50d-4a42-bd24-4b8e0943f53e"
 FILE_EXTENSIONS = ['.pdf', '.jpg', '.jpeg', '.png', '.tiff', '.txt']
 DEBOUNCE_SECONDS = 2
@@ -62,6 +62,6 @@ class ScanSnapHandler(FileSystemEventHandler):
         except OSError:
             filesize = 0
 
-        send_request(filename, filepath, filesize)
+        self.send_request(filename, filepath, filesize)
 
         print()
