@@ -1,0 +1,13 @@
+Build
+
+```
+docker compose -f docker-compose.yml build
+```
+
+Run
+
+```
+docker compose run --rm dir_ma /bin/bash    
+```
+
+The project watches a local folder on your machine mounted through docker.
