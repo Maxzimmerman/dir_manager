@@ -6,11 +6,10 @@ from watchdog.events import FileSystemEventHandler
 
 WATCH_FOLDER = "/home/node/.n8n-files"
 WEBHOOK_URL = "http://n8n:5678/webhook-test/981184cc-f50d-4a42-bd24-4b8e0943f53e"
-FILE_EXTENSIONS = ['.pdf', '.jpg', '.jpeg', '.png', '.tiff', '.txt']
+FILE_EXTENSIONS = ['.txt']
 DEBOUNCE_SECONDS = 2
 
 os.makedirs(WATCH_FOLDER, exist_ok=True)
-
 
 class ScanSnapHandler(FileSystemEventHandler):
     def __init__(self):
@@ -19,22 +18,46 @@ class ScanSnapHandler(FileSystemEventHandler):
     def on_created(self, event):
         self._handle_event(event)
 
-    def on_modified(self, event):
-        self._handle_event(event)
-
-    def send_request(self, filename, filepath, filesize):
+    def send_to_n8n_and_rename(self, filename, filepath, filesize):
+        """Send file info to n8n, get new name, and rename"""
         payload = {
             "filename": filename,
             "filepath": filepath,
             "filesize": filesize,
             "timestamp": datetime.utcnow().isoformat() + "Z",
         }
-
+        
         try:
-            response = requests.post(WEBHOOK_URL, json=payload, timeout=10)
-            print("  ✓ Webhook triggered" if response.ok else f"  ✗ Webhook error {response.status_code}")
+            print(f"  → Sending to n8n...")
+            response = requests.post(WEBHOOK_URL, json=payload, timeout=30)
+            
+            if response.ok:
+                result = response.json()
+                print(f"  ✓ n8n processed successfully")
+                
+                # Get new filename from n8n
+                new_filename = result.get('newFilename')
+                
+                if new_filename and new_filename != filename:
+                    # Rename the file
+                    directory = os.path.dirname(filepath)
+                    new_path = os.path.join(directory, new_filename)
+                    
+                    if os.path.exists(new_path):
+                        print(f"  ⚠ Target exists: {new_filename}")
+                        return
+                    
+                    os.rename(filepath, new_path)
+                    print(f"  ✓ Renamed: {filename} → {new_filename}")
+                else:
+                    print(f"  ℹ No rename needed")
+            else:
+                print(f"  ✗ n8n error {response.status_code}")
+                
         except requests.RequestException as e:
-            print(f"  ✗ Webhook failed: {e}")
+            print(f"  ✗ Request failed: {e}")
+        except OSError as e:
+            print(f"  ✗ Rename failed: {e}")
 
     def _handle_event(self, event):
         if event.is_directory:
@@ -53,7 +76,7 @@ class ScanSnapHandler(FileSystemEventHandler):
                 return
 
         self.last_triggered[filepath] = now
-        time.sleep(1)
+        time.sleep(2)
 
         print(f"[{datetime.now():%Y-%m-%d %H:%M:%S}] New file detected: {filename}")
 
@@ -62,6 +85,5 @@ class ScanSnapHandler(FileSystemEventHandler):
         except OSError:
             filesize = 0
 
-        self.send_request(filename, filepath, filesize)
-
+        self.send_to_n8n_and_rename(filename, filepath, filesize)
         print()
