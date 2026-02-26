@@ -17,17 +17,12 @@ os.makedirs(WATCH_FOLDER, exist_ok=True)
 # ---------------------------------------------------------------------------
 
 def extract_pdf_form_fields(filepath: str) -> dict:
-    """
-    Extract AcroForm field values from a digitally-filled PDF.
-    Returns a dict of {field_label: value} or empty dict if none found.
-    Requires: pip install pypdf
-    """
+    """Extract AcroForm field values from a digitally-filled PDF."""
     try:
         from pypdf import PdfReader
         reader = PdfReader(filepath)
         fields = reader.get_form_text_fields()
         if fields:
-            # Remove empty values
             return {k: v for k, v in fields.items() if v and str(v).strip()}
         return {}
     except Exception as e:
@@ -36,11 +31,7 @@ def extract_pdf_form_fields(filepath: str) -> dict:
 
 
 def extract_pdf_text(filepath: str) -> str:
-    """
-    Extract plain text from a text-based PDF.
-    Returns extracted text or empty string.
-    Requires: pip install pdfplumber
-    """
+    """Extract plain text from a text-based (non-scanned) PDF."""
     try:
         import pdfplumber
         with pdfplumber.open(filepath) as pdf:
@@ -57,31 +48,221 @@ def extract_pdf_text(filepath: str) -> str:
 
 def extract_pdf_ocr(filepath: str) -> str:
     """
-    OCR fallback for scanned PDFs.
-    Requires: pip install pdf2image pytesseract
-              apt-get install tesseract-ocr tesseract-ocr-deu poppler-utils
-    Set ENABLE_OCR=true env variable to activate.
+    OCR for scanned PDFs using pypdfium2 (already installed) + tesseract.
+
+    Container setup required — add to your Dockerfile:
+        RUN apt-get update && apt-get install -y tesseract-ocr tesseract-ocr-deu
+        RUN pip install pytesseract
+
+    Enable by setting env var ENABLE_OCR=true in docker-compose.yml
     """
-    if not os.environ.get("ENABLE_OCR", "").lower() == "true":
+    if os.environ.get("ENABLE_OCR", "").lower() != "true":
         return ""
     try:
-        from pdf2image import convert_from_path
+        import pypdfium2 as pdfium
         import pytesseract
-        images = convert_from_path(filepath, dpi=200)
-        texts = [pytesseract.image_to_string(img, lang="deu+eng") for img in images]
+
+        print(f"  🔍 Running OCR on {os.path.basename(filepath)}...")
+        doc = pdfium.PdfDocument(filepath)
+        texts = []
+
+        for page_index in range(len(doc)):
+            page = doc[page_index]
+            # Render at 250 DPI for good OCR accuracy (scale = dpi/72)
+            bitmap = page.render(scale=250 / 72)
+            pil_image = bitmap.to_pil()
+            text = pytesseract.image_to_string(pil_image, lang="deu+eng")
+            if text.strip():
+                texts.append(text.strip())
+            print(f"  🔍 Page {page_index + 1}: {len(text)} chars extracted")
+
+        doc.close()
         return "\n".join(texts)
+
+    except ImportError as e:
+        print(f"  ⚠ OCR dependency missing: {e}")
+        print(f"  ⚠ Add to Dockerfile: apt-get install tesseract-ocr tesseract-ocr-deu && pip install pytesseract")
+        return ""
     except Exception as e:
         print(f"  ⚠ OCR failed: {e}")
         return ""
 
 
+def clean_ocr_line(line: str) -> str:
+    """
+    Remove OCR checkbox artifacts that appear when tesseract reads form boxes.
+    e.g. "Unger [| Unfall, Unfallfolge" → "Unger"
+         "[x] ambulante Behandlung"      → "ambulante Behandlung"
+    """
+    import re
+    # Remove checkbox patterns: [x], [ ], [|], |], [, |
+    cleaned = re.sub(r'\[[\s\|xX]*\]|\[\||\|\]|\[|\|', ' ', line)
+    # Collapse multiple spaces
+    cleaned = re.sub(r'\s{2,}', ' ', cleaned).strip()
+    return cleaned
+
+
+def parse_patient_info(text: str) -> dict:
+    """
+    Extract structured fields from OCR'd German medical transport forms.
+    Handles the common layout of Muster 4 (Krankenbeförderung):
+      - Insurance name on same line as "Krankenkasse" header or just below
+      - Last name and first name on separate lines after "Name, Vorname" label
+      - Last name line often has form labels merged in by OCR (e.g. "Unger [| Unfall")
+      - Prescription date (Datum) is on the Arzt-Nr row, NOT the treatment date
+    """
+    import re
+
+    # ── Restrict to page 1 only ───────────────────────────────────────────────
+    page1 = re.split(r'Bitte die Fahrt|Bestätigung|Bestatigung', text, maxsplit=1)[0]
+    raw_lines  = page1.split("\n")
+    lines      = [l.strip() for l in raw_lines if l.strip()]
+    clean_lines = [clean_ocr_line(l) for l in lines]
+
+    info = {}
+
+    # ── 1. Insurance company ──────────────────────────────────────────────────
+    # Search first 20 lines for known insurer names
+    for cl in clean_lines[:20]:
+        kk_match = re.search(
+            r'\b(BARMER|AOK|TK\b|DAK|BKK|IKK|KKH|HEK|Techniker\w*)\b',
+            cl, re.IGNORECASE
+        )
+        if kk_match:
+            info["krankenkasse"] = kk_match.group(0).upper()
+            break
+
+    # ── 2. Patient name ───────────────────────────────────────────────────────
+    # Find "Name, Vorname des Versicherten" label, then:
+    #   - Next non-empty cleaned line = last name (take only first token if
+    #     OCR merged a form label onto the same line)
+    #   - Line after that = first name (if it looks like a name, not an address)
+    for i, line in enumerate(lines):
+        if re.search(r'name.*vorname|name.*versicherten', line, re.IGNORECASE):
+            lastname  = None
+            firstname = None
+
+            for j in range(i + 1, min(i + 6, len(lines))):
+                cl = clean_lines[j]
+
+                if len(cl) < 2:
+                    continue
+
+                # Always extract first word first — the name is the first token
+                # even when OCR merges form labels: "Unger Unfall, Unfallfolge"
+                first_word = cl.split()[0].rstrip(".,;:")
+                is_name_token = bool(re.match(r'^[A-Za-zÄÖÜäöüß\-]{2,}$', first_word))
+
+                if lastname is None:
+                    # For lastname: grab first word if it looks like a name,
+                    # regardless of what follows on the same line
+                    if is_name_token:
+                        lastname = first_word
+                    # else skip (e.g. pure number lines, empty tokens)
+                    continue
+
+                elif firstname is None:
+                    # For firstname: skip address / label lines entirely
+                    if re.search(r'str\.|straße|stra.e|\d{5}|\bam\b|\d{2}\.\d{2}', cl, re.IGNORECASE):
+                        continue
+                    if re.search(
+                        r'kostenträger|versicherten|krankenkasse|zuzahlung|'
+                        r'unfall|arbeitsunfall|versorgungsleiden|hinfahrt|rückfahrt',
+                        cl, re.IGNORECASE
+                    ):
+                        continue
+                    if re.match(r'^[\d\s]+$', cl):
+                        continue
+                    if is_name_token:
+                        firstname = first_word
+                    break  # stop after first name attempt regardless
+
+            if lastname:
+                info["name"]      = lastname
+                info["firstname"] = firstname or ""
+            break
+
+    # ── 3. Prescription date (Datum field next to Arzt-Nr.) ──────────────────
+    # Look specifically for the line that contains "Arzt-Nr" and "Datum"
+    # The date on that same line or the very next line is the prescription date.
+    for i, line in enumerate(lines):
+        if re.search(r'arzt.?nr|betriebsstätten', line, re.IGNORECASE):
+            # Check this line and the next two for a date
+            for j in range(i, min(i + 3, len(lines))):
+                dates = re.findall(r'\b\d{1,2}[.\-]\d{2}[.\-]\d{2,4}\b', lines[j])
+                if dates:
+                    info["datum"] = dates[-1]  # last date on that line
+                    break
+            if "datum" in info:
+                break
+
+    # Fallback: last date on page 1 that isn't a birth year
+    if "datum" not in info:
+        all_dates = re.findall(r'\b\d{1,2}[.\-]\d{2}[.\-]\d{2,4}\b', page1)
+        recent = [d for d in all_dates if not re.search(r'\.(19\d{2})$', d)]
+        if recent:
+            info["datum"] = recent[-1]
+        elif all_dates:
+            info["datum"] = all_dates[-1]
+
+    return info
+
+
+def suggest_filename_from_ocr(text: str, fallback_date: str) -> str:
+    """Build a human-friendly filename from OCR text of a German transport form.
+    Target pattern: BARMER_Unger_Ute_2026-02-18
+    """
+    import re
+    info = parse_patient_info(text)
+    parts = []
+
+    if info.get("krankenkasse"):
+        parts.append(info["krankenkasse"])
+
+    if info.get("name"):
+        parts.append(info["name"])
+
+    if info.get("firstname"):
+        parts.append(info["firstname"])
+
+    if not parts:
+        if re.search(r'krankenbeförd|krankenbefoerd', text, re.IGNORECASE):
+            parts.append("Krankenbefoerderung")
+        elif re.search(r'rezept', text, re.IGNORECASE):
+            parts.append("Rezept")
+        elif re.search(r'überweisung', text, re.IGNORECASE):
+            parts.append("Ueberweisung")
+        else:
+            parts.append("Dokument")
+
+    # Normalize date to YYYY-MM-DD
+    if info.get("datum"):
+        m = re.match(r'(\d{1,2})[.\-](\d{2})[.\-](\d{2,4})', info["datum"])
+        if m:
+            day, month, year = m.groups()
+            year = "20" + year if len(year) == 2 else year
+            parts.append(f"{year}-{month}-{day.zfill(2)}")
+    else:
+        parts.append(fallback_date)
+
+    # Sanitize: allow letters (incl. German), digits, dash, underscore
+    name = "_".join(parts)
+    name = name.replace(" ", "_").replace("/", "_")
+    name = "".join(c if (c.isalnum() or c in "-_äöüÄÖÜß") else "_" for c in name)
+    # Collapse multiple underscores
+    name = re.sub(r'_+', '_', name).strip("_")
+    return name[:180]
+
+
 def build_pdf_payload(filename: str, filepath: str, filesize: int) -> dict:
     """
-    Build a rich payload for PDFs by trying multiple extraction strategies:
+    Build payload using three strategies:
       1. AcroForm fields (digitally filled forms)
-      2. Embedded text (pdfplumber)
-      3. OCR (optional, for scanned pages)
+      2. Embedded text layer (pdfplumber)
+      3. OCR (scanned documents — requires ENABLE_OCR=true)
     """
+    fallback_date = datetime.utcnow().strftime("%Y-%m-%d")
+
     payload = {
         "filename": filename,
         "filepath": filepath,
@@ -90,40 +271,52 @@ def build_pdf_payload(filename: str, filepath: str, filesize: int) -> dict:
         "extractionMethod": None,
         "formFields": {},
         "textContent": "",
+        "suggestedName": None,
     }
 
-    # Strategy 1: form fields (best for fillable German medical forms)
+    # Strategy 1: AcroForm fields
     fields = extract_pdf_form_fields(filepath)
     if fields:
         print(f"  📋 Found {len(fields)} form field(s): {list(fields.keys())[:5]}")
         payload["formFields"] = fields
         payload["extractionMethod"] = "acroform"
-        # Try to derive a meaningful name from common field names
         name_keys = [k for k in fields if any(
             kw in k.lower() for kw in ["name", "vorname", "patient", "versicherter", "nachname"]
         )]
         if name_keys:
-            payload["suggestedName"] = " ".join(
+            payload["suggestedName"] = "_".join(
                 str(fields[k]) for k in name_keys[:2]
             ).strip()
 
-    # Strategy 2: embedded text
+    # Strategy 2: Embedded text
     text = extract_pdf_text(filepath)
     if text:
-        payload["textContent"] = text[:4000]  # cap to avoid huge payloads
+        payload["textContent"] = text[:4000]
         if not payload["extractionMethod"]:
             payload["extractionMethod"] = "text"
 
-    # Strategy 3: OCR (only if nothing found yet and env var set)
+    # Strategy 3: OCR (scanned PDFs)
     if not text and not fields:
         ocr_text = extract_pdf_ocr(filepath)
         if ocr_text:
             payload["textContent"] = ocr_text[:4000]
             payload["extractionMethod"] = "ocr"
 
-    if not payload["extractionMethod"]:
-        payload["extractionMethod"] = "none"
-        print(f"  ⚠ No text content found — PDF may be a blank template or scanned without OCR enabled")
+            # ── DEBUG: print full OCR output so you can see what was extracted ──
+            print("  ─── FULL OCR TEXT ───────────────────────────────────────")
+            for i, line in enumerate(ocr_text.split("\n")):
+                print(f"  {i:03d} | {line}")
+            print("  ─────────────────────────────────────────────────────────")
+
+            suggested = suggest_filename_from_ocr(ocr_text, fallback_date)
+            payload["suggestedName"] = suggested
+            print(f"  💡 Suggested filename: {suggested}")
+        else:
+            payload["extractionMethod"] = "none"
+            if os.environ.get("ENABLE_OCR", "").lower() != "true":
+                print(f"  ⚠ Scanned PDF detected — set ENABLE_OCR=true to enable OCR")
+            else:
+                print(f"  ⚠ OCR ran but found no text")
 
     return payload
 
@@ -144,6 +337,7 @@ def build_txt_payload(filename: str, filepath: str, filesize: int) -> dict:
         "extractionMethod": "text",
         "formFields": {},
         "textContent": content,
+        "suggestedName": None,
     }
 
 
@@ -159,16 +353,11 @@ class ScanSnapHandler(FileSystemEventHandler):
         self._handle_event(event)
 
     def send_to_n8n_and_rename(self, filename: str, filepath: str, filesize: int):
-        """Extract content, send to n8n, get new name, rename file."""
         _, ext = os.path.splitext(filename)
+        payload = build_pdf_payload(filename, filepath, filesize) if ext.lower() == ".pdf" \
+            else build_txt_payload(filename, filepath, filesize)
 
-        if ext.lower() == ".pdf":
-            payload = build_pdf_payload(filename, filepath, filesize)
-        else:
-            payload = build_txt_payload(filename, filepath, filesize)
-
-        method = payload.get("extractionMethod", "none")
-        print(f"  📄 Extraction method: {method}")
+        print(f"  📄 Extraction method: {payload.get('extractionMethod', 'none')}")
 
         try:
             print(f"  → Sending to n8n...")
@@ -177,7 +366,6 @@ class ScanSnapHandler(FileSystemEventHandler):
             if response.ok:
                 result = response.json()
                 print(f"  ✓ n8n processed successfully")
-
                 new_filename = result.get("newFilename")
                 if new_filename and new_filename != filename:
                     directory = os.path.dirname(filepath)
@@ -212,7 +400,7 @@ class ScanSnapHandler(FileSystemEventHandler):
                 return
         self.last_triggered[filepath] = now
 
-        time.sleep(2)  # wait for file to finish writing
+        time.sleep(2)
         print(f"[{datetime.now():%Y-%m-%d %H:%M:%S}] New file detected: {filename}")
 
         try:

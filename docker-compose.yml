@@ -1,7 +1,6 @@
 name: "dir_manager"
-
 services:
-  dir_ma: 
+  dir_ma:
     container_name: python_container
     image: python_image
     volumes:
@@ -9,9 +8,10 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+    environment:
+      - ENABLE_OCR=true
     networks:
-      - n8n_n8n-internal  # Connect to n8n's network
-
+      - n8n_n8n-internal
 networks:
   n8n_n8n-internal:
-    external: true  # Use existing network from n8n
+    external: true
