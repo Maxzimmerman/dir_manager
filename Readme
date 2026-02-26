@@ -11,3 +11,306 @@ docker compose run --rm dir_ma /bin/bash
 ```
 
 The project watches a local folder on your machine mounted through docker.
+
+# ScanSnap Auto-Renamer — Project Documentation
+
+> **Who this is for:** Someone who built this with AI help and wants to actually understand what it does, why it works, and what to do when it breaks.
+
+---
+
+## What does this project do?
+
+In one sentence: **it watches a folder, reads any PDF or text file that appears, figures out what's inside it, and renames it to something meaningful.**
+
+The full flow looks like this:
+
+```
+You drop a PDF into a folder
+        ↓
+Python notices the new file
+        ↓
+Python reads the content (3 different methods, tried in order)
+        ↓
+Python sends everything to n8n via the internet (a "webhook")
+        ↓
+n8n decides on a new filename and sends it back
+        ↓
+Python renames the file
+```
+
+That's it. Every piece of code in this project is just doing one of those steps.
+
+---
+
+## The big picture: what are all these tools?
+
+### Docker
+Docker is a way to run software in an isolated box called a **container**. Think of it like a fresh laptop inside your laptop — it has its own operating system, its own programs installed, and its own files. The reason this matters: you need specific programs installed (like tesseract for OCR) and Docker makes sure they're always there, regardless of what's on your actual Mac.
+
+Your project has two containers:
+- **n8n** — a separate project you already had running (the automation tool)
+- **python_container** — this project, running the folder-watching Python code
+
+### docker-compose.yml
+This is the instruction file that tells Docker how to build and run your container. Key things it defines:
+- Which folder on your Mac maps to which folder inside the container
+- Environment variables (like `ENABLE_OCR=true`)
+- Which network to connect to (so your container can talk to n8n)
+
+### Dockerfile
+This is the recipe for building the container image — what operating system to use, what programs to install, what Python packages to include. Every time you change this file, you need to rebuild the image with `docker compose build`.
+
+### n8n
+n8n is a visual automation tool (like a more powerful version of Zapier). In this project it does one job: receive information about a file from Python, decide on a new filename, and send that name back. It's running as a webhook — meaning it sits and listens for incoming HTTP requests, like a mini web server.
+
+### Watchdog (Python library)
+This is the Python library that "watches" a folder. Instead of your code checking every few seconds "is there a new file?", watchdog registers with the operating system and gets told immediately when something changes. It's event-driven: when a file appears, a function called `on_created` is automatically called.
+
+---
+
+## What is OCR and why is it needed?
+
+**OCR stands for Optical Character Recognition.** It's the technology that turns a photo of text into actual text a computer can read.
+
+A PDF can contain text in two fundamentally different ways:
+
+**Type 1 — Digital PDF** (text layer exists)
+When a PDF is created by a computer — like saving a Word document as PDF, or filling a form digitally — the text is stored as real characters inside the file. You can select it, copy it. Programs like `pdfplumber` can extract it directly.
+
+**Type 2 — Scanned PDF** (just an image)
+When someone prints a paper form, fills it in by hand, and then scans it back to PDF with a scanner or phone, the PDF is basically just a photograph. There are no characters stored — just pixels. `pdfplumber` sees nothing. This is why your first attempt returned empty content.
+
+OCR solves the second case by:
+1. Rendering each PDF page as an image
+2. Analyzing the pixels to recognize letter shapes
+3. Outputting its best guess at what the text says
+
+Your scanned Krankenbeförderung forms are Type 2, which is why OCR is needed.
+
+### The OCR tool: Tesseract
+Tesseract is an open-source OCR engine originally developed by HP and now maintained by Google. It's a command-line program installed in your Docker container via:
+```
+apt-get install tesseract-ocr tesseract-ocr-deu
+```
+The `-deu` package adds the German language model — without it, tesseract would try to read German text as English and make many more mistakes.
+
+### pytesseract
+This is a thin Python wrapper that lets your Python code call tesseract. Instead of running tesseract from the terminal yourself, your code does it programmatically.
+
+### pypdfium2
+This is a Python library that renders PDF pages to images. Since tesseract needs an image to work on (not a raw PDF), pypdfium2 does the conversion step. It renders each page at 250 DPI — DPI (dots per inch) controls the resolution. Higher DPI = sharper image = better OCR accuracy, but slower processing.
+
+---
+
+## Walking through watch_folder.py
+
+### The constants at the top
+
+```python
+WATCH_FOLDER = "/home/node/.n8n-files"
+WEBHOOK_URL = "http://n8n:5678/webhook-test/981184cc-..."
+FILE_EXTENSIONS = ['.txt', '.pdf']
+DEBOUNCE_SECONDS = 2
+```
+
+These are configuration values. `WATCH_FOLDER` is the path *inside the Docker container* (not on your Mac — Docker translates between them via the volume setting in docker-compose.yml). `DEBOUNCE_SECONDS` prevents the same file triggering multiple times if the OS fires multiple events for one file drop.
+
+---
+
+### The three PDF extraction strategies
+
+The code tries three methods in order, stopping as soon as one works. This is called a **fallback chain**.
+
+#### Strategy 1: AcroForm fields (`extract_pdf_form_fields`)
+
+Some PDFs are "fillable forms" — they have named input fields baked in, like a web form. The PDF format has a standard for this called AcroForm. If a doctor fills in a PDF form on their computer and saves it, the field values (name, date, etc.) are stored cleanly and can be read directly.
+
+```python
+reader = PdfReader(filepath)
+fields = reader.get_form_text_fields()
+```
+
+This is the most reliable method when it works — the data is structured and clean. But scanned documents have no form fields at all, so this returns nothing.
+
+#### Strategy 2: Embedded text (`extract_pdf_text`)
+
+For digital PDFs that aren't forms — like a letter, a report, a DAK info sheet — the text is stored in the PDF but not as named fields. `pdfplumber` can extract it page by page.
+
+This worked for your DAK info PDF (extractionMethod: "text") but fails entirely for scanned documents.
+
+#### Strategy 3: OCR (`extract_pdf_ocr`)
+
+The last resort. Only runs if strategies 1 and 2 both found nothing, AND `ENABLE_OCR=true` is set. The reason for the env variable toggle is that OCR is slow and CPU-intensive — you don't want it running on every PDF if most of your files are digital.
+
+---
+
+### Parsing the OCR output
+
+OCR doesn't return neat structured data. It returns raw text that looks roughly like what a human would type if they read the form out loud, including noise and mistakes. The parsing functions work around two big problems:
+
+**Problem 1: Checkbox artifacts**
+
+German medical forms have checkboxes. When tesseract sees a checkbox `☐` or `☑`, it often outputs things like `[|`, `[ ]`, `[x]`. On your form, the last name "Unger" was on the same visual line as the "Unfall, Unfallfolge" checkbox label, so OCR produced:
+
+```
+Unger [| Unfall, Unfallfolge
+```
+
+`clean_ocr_line()` strips all those bracket patterns with a regular expression, giving:
+```
+Unger  Unfall, Unfallfolge
+```
+
+Then the name parser takes only the **first word** — "Unger" — since a last name is always the first thing in that field.
+
+**Problem 2: Two pages, wrong page**
+
+Page 2 of the Krankenbeförderung form is the "Bestätigung des Transporteurs" (transport confirmation). It has no patient name — just transport company details. The parsing code splits the full OCR text at the word "Bestätigung" and only analyses page 1.
+
+**What is a regular expression?**
+
+A regular expression (regex) is a mini-language for describing text patterns. For example:
+- `\d{2}\.\d{2}\.\d{2,4}` means: two digits, a dot, two digits, a dot, 2–4 digits — i.e. a date like `18.02.26`
+- `\b(BARMER|AOK|TK)\b` means: any of these words, surrounded by word boundaries
+
+The `re` module in Python lets you search text using these patterns. It's used throughout the parsing code to find dates, insurance names, and patient names.
+
+---
+
+### The payload
+
+After extraction, all the information is bundled into a Python dictionary called a **payload**:
+
+```python
+{
+    "filename": "scan_001.pdf",
+    "textContent": "Verordnung einer Krankenbeförderung...",
+    "formFields": {},
+    "extractionMethod": "ocr",
+    "suggestedName": "Unger_Ute_2026-02-18",
+    ...
+}
+```
+
+This gets sent to n8n as **JSON** (JavaScript Object Notation) — a standard text format for exchanging structured data between programs. `requests.post()` is the Python function that sends it over HTTP, the same protocol your browser uses.
+
+---
+
+### The Watchdog handler (`ScanSnapHandler`)
+
+```python
+class ScanSnapHandler(FileSystemEventHandler):
+    def on_created(self, event):
+        self._handle_event(event)
+```
+
+A **class** in Python is a template for creating objects that bundle data and functions together. `ScanSnapHandler` inherits from `FileSystemEventHandler` — meaning it gets all the folder-watching behaviour for free and just adds the specific logic for what to do when a file appears.
+
+`on_created` is called automatically by watchdog when a new file is created. The 2-second `time.sleep(2)` before processing is important: file copy operations aren't instant. If you process the file the millisecond it appears, it might still be half-written.
+
+**Debouncing:** `self.last_triggered` is a dictionary that records the last time each file path triggered an event. If the same file triggers again within 2 seconds (which can happen with some apps), it's ignored. This prevents processing the same file twice.
+
+---
+
+## The n8n workflow
+
+The n8n workflow receives the payload and runs a JavaScript Code node:
+
+```
+Webhook → Code node (Generate New Filename) → Respond to Webhook
+```
+
+The Code node reads `suggestedName` from the payload (set by Python's OCR parsing) or falls back to building a name from `textContent`. It sends back JSON like:
+```json
+{ "newFilename": "Unger_Ute_2026-02-18.pdf" }
+```
+
+Python receives this, and renames the file.
+
+> **Why use n8n at all if Python already suggests the name?**
+> Good question. Currently n8n mostly passes through what Python already figured out. The value is that n8n makes it easy to add logic visually later — for example, moving files to different folders based on content, sending a notification, or logging to a spreadsheet — without touching Python code.
+
+---
+
+## Files in the project
+
+```
+dir_manager/
+├── watch_folder.py     # All the Python logic (reading files, OCR, sending to n8n)
+├── main.py             # Entry point — starts the watchdog observer loop
+├── entrypoint.sh       # Script that runs when the Docker container starts
+├── Dockerfile          # Recipe for building the container
+├── docker-compose.yml  # Configuration for running the container
+└── requirements.txt    # List of Python packages to install
+```
+
+---
+
+## How to run and rebuild
+
+**First time / after changing Dockerfile or requirements.txt:**
+```bash
+docker compose build --no-cache
+docker compose up
+```
+
+**Normal start:**
+```bash
+docker compose up
+```
+
+**Stop:**
+```bash
+docker compose down
+```
+
+**See live logs:**
+```bash
+docker compose logs -f
+```
+
+**Get a shell inside the running container (useful for debugging):**
+```bash
+docker exec -it python_container /bin/bash
+```
+
+---
+
+## What each environment variable does
+
+| Variable | Value | Effect |
+|---|---|---|
+| `ENABLE_OCR` | `true` | Activates OCR for scanned PDFs. Leave unset to skip OCR (faster). |
+
+---
+
+## Common failure modes and what they mean
+
+**`n8n error 404: webhook not registered`**
+n8n's test webhook only activates when you have the workflow open in the browser and click "Execute workflow". For permanent use you need to switch the workflow to production mode (toggle from "Test" to "Active" in n8n) and update `WEBHOOK_URL` to use `/webhook/` instead of `/webhook-test/`.
+
+**`⚠ No text content found — PDF may be a blank template or scanned without OCR enabled`**
+Either `ENABLE_OCR` is not set to `true`, or the PDF is genuinely a blank template with nothing to read.
+
+**`⚠ OCR ran but found no text`**
+OCR ran but tesseract couldn't recognize anything. Usually means the scan quality is very poor (too dark, blurry, or very low resolution).
+
+**`⚠ Target already exists`**
+A file with the generated name already exists in the folder. The rename is skipped to avoid overwriting. You'll need to manually resolve the naming conflict.
+
+**`✗ Request failed: ...`**
+Python couldn't reach n8n at all. Check that both containers are on the same Docker network (`n8n_n8n-internal`) and that n8n is running.
+
+---
+
+## Things to be aware of (the "dangerous" part of vibe coding)
+
+**No error recovery for failed renames.** If the rename fails halfway (e.g. disk full), the file stays with its original name and no retry happens. The log will show the error but nothing will fix it automatically.
+
+**No queue.** If 10 files arrive at once, they're all processed simultaneously. This is usually fine but could cause issues under heavy load.
+
+**The OCR parsing is tuned to one specific form** (Muster 4 Krankenbeförderung). Other form types will fall back to the generic "Dokument_date" naming. The `parse_patient_info` function would need extension to handle different layouts.
+
+**The webhook URL is hardcoded.** If you change your n8n setup, you need to update `WEBHOOK_URL` in `watch_folder.py` and rebuild.
+
+**Tesseract makes mistakes.** OCR is never 100% accurate, especially on handwritten or low-quality scans. Always sanity-check renamed files occasionally to catch misreadings.
