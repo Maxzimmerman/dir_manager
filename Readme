@@ -222,7 +222,7 @@ Webhook → Code node (Generate New Filename) → Respond to Webhook
 
 The Code node reads `suggestedName` from the payload (set by Python's OCR parsing) or falls back to building a name from `textContent`. It sends back JSON like:
 ```json
-{ "newFilename": "Unger_Ute_2026-02-18.pdf" }
+{ "newFileName": "Unger_Ute_2026-02-18.pdf" }
 ```
 
 Python receives this, and renames the file.
