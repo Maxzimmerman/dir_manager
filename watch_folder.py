@@ -106,7 +106,7 @@ def build_payload(filename: str, filepath: str, filesize: int) -> dict:
         "filename": filename,
         "filepath": filepath,
         "filesize": filesize,
-        "timestamp": datetime.utcnow().isoformat() + "Z",
+        "timestamp": datetime.utcnow().isoformat(),
         "extractionMethod": "none",
         "formFields": {},
         "textContent": "",
@@ -175,7 +175,7 @@ class ScanSnapHandler(FileSystemEventHandler):
 
         try:
             print(f"  Sending to n8n...")
-            response = requests.post(WEBHOOK_TEST_URL, json=payload, timeout=60)
+            response = requests.post(WEBHOOK_TEST_URL, json=payload, timeout=120)
 
             if response.ok:
                 result = response.json()
