@@ -6,6 +6,7 @@ from watchdog.events import FileSystemEventHandler
 
 WATCH_FOLDER = "/home/node/.n8n-files"
 WEBHOOK_URL = "http://n8n:5678/webhook/981184cc-f50d-4a42-bd24-4b8e0943f53e"
+WEBHOOK_TEST_URL = "http://n8n-n8n-1:5678/webhook-test/981184cc-f50d-4a42-bd24-4b8e0943f53e"
                 
 FILE_EXTENSIONS = ['.txt', '.pdf']
 DEBOUNCE_SECONDS = 2
@@ -174,7 +175,7 @@ class ScanSnapHandler(FileSystemEventHandler):
 
         try:
             print(f"  Sending to n8n...")
-            response = requests.post(WEBHOOK_URL, json=payload, timeout=60)
+            response = requests.post(WEBHOOK_TEST_URL, json=payload, timeout=60)
 
             if response.ok:
                 result = response.json()
