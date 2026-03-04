@@ -46,49 +46,30 @@ def extract_pdf_text(filepath: str) -> str:
 
 
 def extract_pdf_ocr(filepath: str) -> str:
-    """
-    OCR for scanned PDFs. Requires ENABLE_OCR=true env var.
-    Uses pypdfium2 (already installed) to render pages, then tesseract.
-
-    Dockerfile requirements:
-        RUN apt-get install -y tesseract-ocr tesseract-ocr-deu
-        RUN pip install pytesseract
-    """
     if os.environ.get("ENABLE_OCR", "").lower() != "true":
         return ""
     try:
         import pypdfium2 as pdfium
         import pytesseract
-        from PIL import ImageFilter, ImageEnhance, ImageOps
+        from PIL import ImageOps, ImageEnhance
 
         print(f"  Running OCR...")
         doc = pdfium.PdfDocument(filepath)
-        texts = []
+        
+        # Only page 1 — name/dates are always there
+        page = doc[0]
+        bitmap = page.render(scale=200 / 72)  # 200 DPI is enough, 300 is overkill
+        img = bitmap.to_pil()
+        img = img.convert("L")
+        img = ImageOps.autocontrast(img, cutoff=2)
+        img = ImageEnhance.Contrast(img).enhance(1.8)
+        # removed SHARPEN — marginal benefit, adds time
 
-        for i in range(len(doc)):
-            page = doc[i]
-            bitmap = page.render(scale=300 / 72)  # 300 DPI
-            img = bitmap.to_pil()
-
-            # Preprocess: greyscale + contrast boost improves accuracy on
-            # coloured form backgrounds (pink, blue) and low-quality scans
-            img = img.convert("L")
-            img = ImageOps.autocontrast(img, cutoff=2)
-            img = ImageEnhance.Contrast(img).enhance(1.8)
-            img = img.filter(ImageFilter.SHARPEN)
-
-            text = pytesseract.image_to_string(img, lang="deu+eng",
-                                               config="--psm 6")
-            if text.strip():
-                texts.append(text.strip())
-            print(f"  Page {i + 1}: {len(text)} chars extracted")
-
+        text = pytesseract.image_to_string(img, lang="deu+eng", config="--psm 6")
         doc.close()
-        return "\n".join(texts)
+        print(f"  Page 1: {len(text)} chars extracted")
+        return text.strip()
 
-    except ImportError as e:
-        print(f"  WARNING: OCR dependency missing: {e}")
-        return ""
     except Exception as e:
         print(f"  WARNING: OCR failed: {e}")
         return ""
@@ -106,7 +87,7 @@ def build_payload(filename: str, filepath: str, filesize: int) -> dict:
         "filename": filename,
         "filepath": filepath,
         "filesize": filesize,
-        "timestamp": datetime.utcnow().isoformat(),
+        "timestamp": datetime.utcnow().strftime("%Y_%m_%d_%H_%M_%S"),
         "extractionMethod": "none",
         "formFields": {},
         "textContent": "",

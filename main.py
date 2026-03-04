@@ -22,7 +22,7 @@ def main():
     event_handler = ScanSnapHandler()
     
     # Increase timeout for more aggressive polling
-    observer = Observer(timeout=5)  # Poll every 5 seconds
+    observer = Observer(timeout=1)  # Poll every 5 seconds
     observer.schedule(event_handler, WATCH_FOLDER, recursive=False)
     observer.start()
 
